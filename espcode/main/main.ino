@@ -11,8 +11,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define RST_PIN         2
-#define SS_PIN          21
+#define RST_PIN         4
+#define SS_PIN          5
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);  // Create MFRC522 instance
 
@@ -21,6 +21,8 @@ const char* jsonFilePath = "/uids.json";
 // Replace with your Wi-Fi
 #define WIFI_SSID "A.T.O.M_Labs"
 #define WIFI_PASSWORD "atom281121"
+#define doorRelay 27
+#define irSensor 33
 
 // Firebase Config
 #define API_KEY "AIzaSyAoer09OK5EPK6oFtCjIs8FxfHUVRYppUA"
@@ -44,8 +46,9 @@ void logTaskFunction(void *param) {
   LogEntry entry;
   while (true) {
     if (xQueueReceive(logQueue, &entry, portMAX_DELAY)) {
-      sendDiscordNotification(entry.name + " has entered with UID: " + entry.uid + " at Time: " + entry.time);
-      String path = "/logs/" + String(millis());
+      sendDiscordNotification(entry.name + " has entered at Time: " + entry.time);
+      //entry.UID has the uid
+      String path = "/logs/" + generateLogID(entry.uid,entry.time);
       FirebaseJson json;
       json.set("uid", entry.uid);
       json.set("name", entry.name);
@@ -60,12 +63,37 @@ void logTaskFunction(void *param) {
   }
 }
 
+uint64_t fnv1a64(const char* data, size_t len) {
+    uint64_t hash = 1469598103934665603ULL; // FNV offset basis
+    const uint64_t prime = 1099511628211ULL; // FNV prime
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint8_t)data[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+String generateLogID(const String& rfidUid, const String& timeStr) {
+    // Combine UID + Time string
+    String input = rfidUid + "_" + timeStr;
+
+    // Hash input
+    uint64_t hash = fnv1a64(input.c_str(), input.length());
+
+    // Convert to hex string (16 chars)
+    char buf[17];
+    sprintf(buf, "%016llx", (unsigned long long)hash);
+
+    return String(buf);
+}
+
 // -------------------------------------
 
 void setup() {
   Serial.begin(115200);
   while (!Serial);
-
+  pinMode(doorRelay, OUTPUT);
+  pinMode(irSensor, INPUT);
   // Init SPI and MFRC522
   SPI.begin();
   mfrc522.PCD_Init();
@@ -87,8 +115,8 @@ void setup() {
     }
   }
 
-  addUID("4E 12 31 03", "Sanidhya Jain");
-  addUID("A3 DB 59 FB", "Shivam Gupta");
+  // addUID("4E 12 31 03", "Sanidhya Jain");
+  // addUID("A3 DB 59 FB", "Shivam Gupta");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -140,6 +168,9 @@ void setup() {
 }
 
 void loop() {
+  if(digitalRead(irSensor) == HIGH){
+    unlockdoor();
+  }
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
     return;
 
@@ -150,6 +181,7 @@ void loop() {
   String name;
   if (checkUIDInFile(scannedUID, name)) {
     Serial.println("Access accepted: " + name);
+    unlockdoor();
   } else {
     name = "Unknown";
     Serial.println("Access denied");
@@ -176,7 +208,12 @@ String getUIDString() {
   uidStr.toUpperCase();
   return uidStr;
 }
-
+void unlockdoor(){
+  digitalWrite(doorRelay, HIGH);
+  Serial.println("door unlocked");
+  delay(4000);
+  digitalWrite(doorRelay,LOW);
+}
 bool checkUIDInFile(String uid, String &nameOut) {
   File file = SPIFFS.open(jsonFilePath, "r");
   if (!file) {
