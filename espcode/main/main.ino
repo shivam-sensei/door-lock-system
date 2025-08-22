@@ -51,7 +51,7 @@ void setup() {
       Serial.println("Created empty UID file.");
     }
   }
-  addUID("4E 12 31 03", "Sanidhya Jain");
+  // addUID("4E 12 31 03", "Sanidhya Jain");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -119,6 +119,7 @@ String getUIDString() {
   uidStr.toUpperCase();
   return uidStr;
 }
+
 
 bool checkUIDInFile(String uid, String &nameOut) {
   File file = SPIFFS.open(jsonFilePath, "r");

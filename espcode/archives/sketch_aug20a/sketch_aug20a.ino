@@ -1,0 +1,336 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <FirebaseESP32.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <secrets.h>
+
+
+#define RST_PIN 4
+#define SS_PIN 5
+#define WIFI_TIMEOUT 30000    // 30 seconds
+#define NTP_TIMEOUT 20000     // 20 seconds
+#define FIREBASE_TIMEOUT 5000 // 5 seconds
+#define doorRelay 27
+#define irSensor 33
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+const char* jsonFilePath = "/uids.json";
+bool wifiConnected = false;
+bool firebaseReady = false;
+bool ntpSynced = false;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+TaskHandle_t Task1;
+
+Void Task1code( void * parameter) {
+  for(;;) {
+
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  pinMode(doorRelay, OUTPUT);
+  pinMode(irSensor, INPUT);
+  // Init SPI and MFRC522 - This always works offline
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println("RFID reader initialized.");
+
+  xTaskCreatePinnedToCore(
+      Task1code, /* Function to implement the task */
+      "Task1", /* Name of the task */
+      10000,  /* Stack size in words */
+      NULL,  /* Task input parameter */
+      0,  /* Priority of the task */
+      &Task1,  /* Task handle. */
+      0 /* Core where the task should run */
+  );
+
+  // Init SPIFFS - This always works offline
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Failed to mount SPIFFS");
+    return;
+  }
+
+  // Create dummy UID file if not exists
+  if (!SPIFFS.exists(jsonFilePath)) {
+    File file = SPIFFS.open(jsonFilePath, FILE_WRITE);
+    if (file) {
+      file.print("{}");
+      file.close();
+      Serial.println("Created empty UID file.");
+    }
+  }
+  // addUID("4E 12 31 03", "Sanidhya Jain");
+
+  // Try WiFi connection with timeout
+  setupWiFi();
+  
+  if (wifiConnected) {
+    setupFirebase();
+    setupNTP();
+  } else {
+    Serial.println("Starting in OFFLINE MODE - Core functionality available");
+  }
+
+  Serial.println("System ready! RFID access control active.");
+}
+
+void setupWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - startTime > WIFI_TIMEOUT) {
+      Serial.println("\nWiFi connection timeout! Starting offline mode...");
+      wifiConnected = false;
+      return;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  
+  Serial.println(" Connected!");
+  wifiConnected = true;
+}
+
+void setupFirebase() {
+  if (!wifiConnected) return;
+  
+  config.api_key = FIREBASE_API_KEY;
+  config.database_url = FIREBASE_DB_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase signup successful");
+    firebaseReady = true;
+  } else {
+    Serial.printf("Firebase signup failed: %s\n", config.signer.signupError.message.c_str());
+    firebaseReady = false;
+    return;
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  // Set Firebase timeout using the actual available method
+  Firebase.setReadTimeout(fbdo, FIREBASE_TIMEOUT); // 5 seconds
+}
+
+void setupNTP() {
+  if (!wifiConnected) return;
+  
+  // NTP Config (IST = UTC+5:30)
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.print("Waiting for NTP time sync");
+  unsigned long ntpStart = millis();
+  
+  while (time(nullptr) < 100000) {
+    if (millis() - ntpStart > NTP_TIMEOUT) {
+      Serial.println("\nNTP sync timeout! Using system time...");
+      ntpSynced = false;
+      return;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  
+  Serial.println(" Time synced.");
+  ntpSynced = true;
+}
+
+void loop() {
+  if(digitalRead(irSensor) == HIGH){
+    unlockdoor();
+  }
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
+    return;
+
+  String scannedUID = getUIDString();
+  Serial.print("Scanned UID: ");
+  Serial.println(scannedUID);
+
+  String name;
+  bool accessGranted = checkUIDInFile(scannedUID, name);
+  if (accessGranted) {
+    Serial.println("Access GRANTED: " + name);
+        unlockdoor();
+  } else {
+    Serial.println("Access DENIED: Unknown UID");
+    name = "Unknown";
+  }
+
+  // Try to log online only if network is available
+  tryOnlineLogging(scannedUID, name, accessGranted);
+
+  delay(1500);  // Debounce read
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+void tryOnlineLogging(String uid, String name, bool accessGranted) {
+  // Check if we can go online
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println("Offline mode - no cloud logging");
+    return;
+  }
+  
+  if (!firebaseReady) {
+    Serial.println("Firebase not ready - skipping log");
+    return;
+  }
+  
+  logToFirebaseWithTimeout(uid, name);
+}
+void unlockdoor(){
+  digitalWrite(doorRelay, HIGH);
+  Serial.println("door unlocked");
+  delay(4000);
+  digitalWrite(doorRelay,LOW);
+}
+void logToFirebaseWithTimeout(String uid, String name) {
+  Serial.println("Attempting cloud logging...");
+  
+  sendDiscordNotification(name + " has entered with UID: " + uid + " at " + getCurrentTime());
+  
+  String path = "/logs/" + generateLogID(uid,name);
+  FirebaseJson json;
+  json.set("uid", uid);
+  json.set("name", name);
+  json.set("time", getCurrentTime());
+
+  // The timeout is already set in setupFirebase() using Firebase.setReadTimeout()
+  if (Firebase.setJSON(fbdo, path.c_str(), json)) {
+    Serial.println("Firebase logged: " + getCurrentTime());
+  } else {
+    Serial.println("Firebase error (timeout/connection): " + fbdo.errorReason());
+  }
+}
+uint64_t fnv1a64(const char* data, size_t len) {
+    uint64_t hash = 1469598103934665603ULL;  // FNV offset basis
+    const uint64_t prime = 1099511628211ULL; // FNV prime
+    
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint8_t)data[i];
+        hash *= prime;
+    }
+    
+    return hash;
+}
+String generateLogID(const String& rfidUid, const String& timeStr) {
+    // Combine UID + Time string
+    String input = rfidUid + "_" + timeStr;
+    
+    // Hash the combined input
+    uint64_t hash = fnv1a64(input.c_str(), input.length());
+    
+    // Convert to 16-character hex string
+    char buf[17];
+    sprintf(buf, "%016llx", (unsigned long long)hash);
+    
+    return String(buf);
+}
+
+String getCurrentTime() {
+  if (!ntpSynced) {
+    // Fallback to millis-based timestamp if NTP failed
+    return "System_" + String(millis());
+  }
+  
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+void sendDiscordNotification(String message) {
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    return; // Skip if offline
+  }
+  
+  HTTPClient http;
+  http.setTimeout(5000); // 5 second timeout
+  http.begin(DISCORD_WEBHOOK);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{\"content\": \"" + message + "\"}";
+  int httpResponseCode = http.POST(payload);
+
+  if (httpResponseCode > 0) {
+    Serial.println("✓ Discord notified: " + String(httpResponseCode));
+  } else {
+    Serial.println("✗ Discord failed: " + http.errorToString(httpResponseCode));
+  }
+
+  http.end();
+}
+
+// Existing functions remain the same
+String getUIDString() {
+  String uidStr = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10)
+      uidStr += "0";
+    uidStr += String(mfrc522.uid.uidByte[i], HEX);
+    if (i < mfrc522.uid.size - 1) uidStr += " ";
+  }
+  uidStr.toUpperCase();
+  return uidStr;
+}
+
+bool checkUIDInFile(String uid, String& nameOut) {
+  File file = SPIFFS.open(jsonFilePath, "r");
+  if (!file) {
+    Serial.println("Could not open UID file.");
+    return false;
+  }
+
+  const size_t capacity = 1024;
+  StaticJsonDocument<capacity> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+
+  if (error) {
+    Serial.println("Failed to parse JSON");
+    return false;
+  }
+
+  if (doc.containsKey(uid)) {
+    nameOut = doc[uid].as<String>();
+    return true;
+  }
+
+  return false;
+}
+
+void addUID(String uid, String name) {
+  File file = SPIFFS.open(jsonFilePath, "r");
+  StaticJsonDocument<1024> doc;
+  if (file) {
+    deserializeJson(doc, file);
+    file.close();
+  }
+
+  doc[uid] = name;
+
+  file = SPIFFS.open(jsonFilePath, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+    Serial.println("UID saved: " + uid);
+  }
+}
