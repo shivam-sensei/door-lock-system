@@ -9,7 +9,6 @@
 #include <Arduino.h>
 #include <secrets.h>
 
-
 #define RST_PIN 4
 #define SS_PIN 5
 #define WIFI_TIMEOUT 30000     // 30 seconds
@@ -183,9 +182,6 @@ void setupNTP() {
   ntpSynced = true;
 }
 
-#include <Arduino.h>
-#include <MFRC522.h>
-
 // Assuming you already have: irSensor pin, mfrc522 object, unlockdoor(),
 // checkUIDInFile(), getUIDString(), tryOnlineLogging() implemented
 
@@ -237,7 +233,7 @@ void handleRFID() {
   }
   LogEntry entry = { scannedUID, name, accessGranted };
   xQueueSend(logQueue, &entry, 0);
-
+  
   // Cleanup card
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
