@@ -28,7 +28,7 @@
 
 
 #define BUTTON_SELECT 32  // Button to select character
-#define BUTTON_DELETE 16  // Button to delete last character
+#define BUTTON_DELETE 2  // Button to delete last character
 #define POT_PIN 34        // Potentiometer pin
 String enteredName = "";  // Store the entered name
 char currentChar = 'A';
@@ -220,8 +220,8 @@ void setup() {
     ;
   pinMode(doorRelay, OUTPUT);
   pinMode(irSensor, INPUT);
-  pinMode(BUTTON_SELECT, INPUT);
-  pinMode(BUTTON_DELETE, INPUT);
+  pinMode(BUTTON_SELECT, INPUT_PULLUP);
+  pinMode(BUTTON_DELETE, INPUT_PULLDOWN);
   pinMode(POT_PIN, INPUT);
   oled1.begin();
   oled2.begin();
@@ -388,7 +388,12 @@ void menu() {
 
   // Read potentiometer → pick option
   int potValue = analogRead(POT_PIN);
-  int option = map(potValue, 0, 4095, 1, 2);
+  int option;
+  if (potValue < 2048) {  // Lower half = option 1
+    option = 1;
+  } else {  // Upper half = option 2
+    option = 2;
+  }
 
   // Draw menu
   oled1.drawStr(0, 12, "ADMIN MODE");
@@ -404,6 +409,7 @@ void menu() {
 
   // --- DELETE button → exit menu ---
   bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
+    Serial.println(deleteCurrentState);
   if (deleteCurrentState && !deletePressed && millis() - lastDeleteTime > debounceDelay) {
     Serial.println("Button B pressed");
     deletePressed = true;
@@ -418,6 +424,7 @@ void menu() {
 
   // --- SELECT button → confirm option ---
   bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
+
   if (selectCurrentState && !selectPressed && millis() - lastSelectTime > debounceDelay) {
     selectPressed = true;
     lastSelectTime = millis();
@@ -452,13 +459,30 @@ void menu() {
 
 
 void handleRFID() {
-  // If no new card, skip
+  // Check for menu opening with debouncing (SELECT button only)
   bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
-  if (selectCurrentState) {
-    delay(100);
+
+  // SELECT button pressed to open menu
+  if (selectCurrentState && !selectPressed && (millis() - lastSelectTime) > debounceDelay) {
+    selectPressed = true;
+    lastSelectTime = millis();
+
+    Serial.println("Opening menu...");
     menuState = MENU_OPEN;
     return;
   }
+
+  // Reset selectPressed flag when button is released
+  if (!selectCurrentState) {
+    selectPressed = false;
+  }
+
+  // Don't process RFID while SELECT button is being pressed
+  if (selectCurrentState) {
+    return;
+  }
+
+  // Original RFID handling code
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
     return;
 
@@ -503,6 +527,7 @@ void TaskCore0code(void* pvParameters) {
 
   for (;;) {
     if (menuState == NORMAL_MODE) {
+      showDefaultDisplay();
       handleIRSensor();
       handleRFID();
       if (entryActive && millis() - entryStart >= 2000) {
@@ -518,71 +543,78 @@ void TaskCore0code(void* pvParameters) {
         menuState = NAME_ENTRY;
         enteredName = "";  // reset name entry
         currentChar = 'A';
+        // Reset button states when entering NAME_ENTRY mode
+        selectPressed = false;
+        deletePressed = false;
+        bothPressed = false;
         mfrc522.PICC_HaltA();
         mfrc522.PCD_StopCrypto1();
       }
     } else if (menuState == NAME_ENTRY) {
-      selectPressed = false;
-      deletePressed = false;
-      bothPressed = false;
-
-      handleNameEntry();  // <-- this is your pasted code logic, moved to function
+      // DON'T reset button states here - let handleNameEntry manage them
+      handleNameEntry();
     }
-    vTaskDelay(50 / portTICK_PERIOD_MS);  // small yield for Wi-Fi system tasks
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
 
 void handleNameEntry() {
   int potValue = analogRead(POT_PIN);
-  int charIndex = map(potValue, 0, 4095, 0, 26);
-  currentChar = (charIndex < 26) ? ('A' + charIndex) : ' ';
+  int charIndex = map(potValue, 0, 4095, 0, 27);  // 0-25 for A-Z, 26 for space, 27 for OK
+
+  if (charIndex < 26) {
+    currentChar = 'A' + charIndex;  // A-Z
+  } else if (charIndex == 26) {
+    currentChar = ' ';  // Space
+  } else {
+    currentChar = '\0';  // Special marker for OK (won't be displayed as char)
+  }
 
   bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
   bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
 
-  // --- BOTH pressed = SAVE NAME ---
-  if (selectCurrentState && deleteCurrentState) {
-    if (!bothPressed && millis() - lastSelectTime > debounceDelay && millis() - lastDeleteTime > debounceDelay) {
-      bothPressed = true;
-      lastSelectTime = lastDeleteTime = millis();
+  // --- SELECT pressed ---
+  if (selectCurrentState && !selectPressed && (millis() - lastSelectTime) > debounceDelay) {
+    selectPressed = true;
+    lastSelectTime = millis();
+
+    if (charIndex >= 27) {  // OK position
+      // Confirm and save the name
       if (enteredName.length() > 0 && pendingUID.length() > 0) {
         Serial.println("Saving UID+Name: " + pendingUID + " => " + enteredName);
         addUID(pendingUID, enteredName);
         enteredName = "";
         pendingUID = "";
         menuState = NORMAL_MODE;
+        // Reset button states when exiting
+        selectPressed = false;
+        deletePressed = false;
+        return;
+      }
+    } else {
+      // Add current character
+      if (enteredName.length() < 16) {
+        enteredName += currentChar;
+        Serial.println("Added character: " + String(currentChar) + ", Name now: " + enteredName);
       }
     }
-  } else {
-    bothPressed = false;
-  }
-
-
-  // reset once either button is released
-  if (!selectCurrentState || !deleteCurrentState) {
-    bothPressed = false;
-  }
-
-  // --- SELECT alone ---
-  if (selectCurrentState && !selectPressed && (millis() - lastSelectTime) > debounceDelay) {
-    selectPressed = true;
-    lastSelectTime = millis();
-    if (enteredName.length() < 16) enteredName += currentChar;
   }
   if (!selectCurrentState) selectPressed = false;
 
-  // --- DELETE alone ---
+  // --- DELETE button ---
   if (deleteCurrentState && !deletePressed && (millis() - lastDeleteTime) > debounceDelay) {
     deletePressed = true;
     lastDeleteTime = millis();
-    if (enteredName.length() > 0) enteredName.remove(enteredName.length() - 1);
+    if (enteredName.length() > 0) {
+      enteredName.remove(enteredName.length() - 1);
+      Serial.println("Deleted character, Name now: " + enteredName);
+    }
   }
   if (!deleteCurrentState) deletePressed = false;
 
   updateNameEntryDisplay();
 }
-
 
 void updateNameEntryDisplay() {
   oled1.clearBuffer();
@@ -600,11 +632,21 @@ void updateNameEntryDisplay() {
 
   oled1.setCursor(0, 55);
   oled1.print("Char: ");
-  oled1.print(currentChar);
+
+  // Display current selection
+  int potValue = analogRead(POT_PIN);
+  int charIndex = map(potValue, 0, 4095, 0, 27);
+
+  if (charIndex < 26) {
+    oled1.print((char)('A' + charIndex));  // A-Z
+  } else if (charIndex == 26) {
+    oled1.print("SPACE");  // Space
+  } else {
+    oled1.print("OK");  // Confirmation
+  }
 
   oled1.sendBuffer();
 }
-
 
 void TaskCore1code(void* pvParameters) {
   LogEntry entry;
@@ -675,7 +717,7 @@ void tryOnlineLogging(String uid, String name, bool accessGranted) {
 void logToFirebaseWithTimeout(String uid, String name) {
   Serial.println("Attempting cloud logging...");
 
-  sendDiscordNotification(name + " has entered with UID: " + uid + " at " + getCurrentTime());
+  sendDiscordNotification(name + " has entered at " + getCurrentTime());
 
   String path = "/logs/" + generateLogID(uid);
   FirebaseJson json;
