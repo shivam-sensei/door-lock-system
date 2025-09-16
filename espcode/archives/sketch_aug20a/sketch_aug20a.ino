@@ -16,8 +16,6 @@
 #define FIREBASE_DB_URL "https://lab-server-5128b-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define DISCORD_WEBHOOK "https://discord.com/api/webhooks/1369580386606387221/tlfN0ha-OPRweMG0Art3HREDREAEHkToJC5nTvmJjzEuGaZBisp310lZycZKaViJR9Ew"
 
-
-
 #define RST_PIN 4
 #define SS_PIN 5
 #define WIFI_TIMEOUT 30000     // 30 seconds
@@ -26,17 +24,13 @@
 #define doorRelay 27
 #define irSensor 33
 
-
 #define BUTTON_SELECT 32  // Button to select character
-#define BUTTON_DELETE 2  // Button to delete last character
 #define POT_PIN 34        // Potentiometer pin
 String enteredName = "";  // Store the entered name
 char currentChar = 'A';
 // Button debounce
 bool selectPressed = false;
-bool deletePressed = false;
 unsigned long lastSelectTime = 0;
-unsigned long lastDeleteTime = 0;
 const unsigned long debounceDelay = 200;
 enum MenuState { NORMAL_MODE,
                  MENU_OPEN,
@@ -47,6 +41,37 @@ MenuState menuState = NORMAL_MODE;
 String pendingUID = "";
 bool entryActive = false;
 unsigned long entryStart = 0;
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled1(U8G2_R0, /* clock=*/22, /* data=*/21, /* reset=*/U8X8_PIN_NONE);  //small oled
+U8G2_SH1106_128X64_NONAME_F_SW_I2C oled2(U8G2_R0, /* clock=*/25, /* data=*/26, /* reset=*/U8X8_PIN_NONE);   //big oled
+
+const char* jsonFilePath = "/uids.json";
+const char* offlineLogPath = "/offline.json";
+bool wifiConnected = false;
+long int previousMillis = 0;
+bool firebaseReady = false;
+bool ntpSynced = false;
+bool wifidisconnect = false; // FIXED: Initialize properly
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+TaskHandle_t TaskCore0;
+TaskHandle_t TaskCore1;
+TaskHandle_t unlockTaskHandle = NULL;
+
+// ====== Queue for log transfer ======
+struct LogEntry {
+  String uid;
+  String name;
+  bool accessGranted;
+};
+QueueHandle_t logQueue;
+
+// Add bitmap declarations (you'll need to define these based on your images)
+// For now, adding placeholder - replace with your actual bitmap data
 unsigned char b2[] PROGMEM = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -181,60 +206,36 @@ unsigned char b1[] PROGMEM = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled1(U8G2_R0, /* clock=*/22, /* data=*/21, /* reset=*/U8X8_PIN_NONE);  //small oled
-U8G2_SH1106_128X64_NONAME_F_SW_I2C oled2(U8G2_R0, /* clock=*/25, /* data=*/26, /* reset=*/U8X8_PIN_NONE);   //big oled
-
-const char* jsonFilePath = "/uids.json";
-const char* offlineLogPath = "/offline.json";
-bool wifiConnected = false;
-long int previousMillis = 0;
-bool firebaseReady = false;
-bool ntpSynced = false;
-
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
-
-TaskHandle_t TaskCore0;
-TaskHandle_t TaskCore1;
-TaskHandle_t unlockTaskHandle = NULL;
-
-// ====== Queue for log transfer ======
-struct LogEntry {
-  String uid;
-  String name;
-  bool accessGranted;
-};
-QueueHandle_t logQueue;
 uint8_t reverse_byte(uint8_t b) {
   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
   return b;
 }
-void setup() {
 
+void setup() {
   Serial.begin(115200);
   while (!Serial)
     ;
   pinMode(doorRelay, OUTPUT);
   pinMode(irSensor, INPUT);
   pinMode(BUTTON_SELECT, INPUT_PULLUP);
-  pinMode(BUTTON_DELETE, INPUT_PULLDOWN);
   pinMode(POT_PIN, INPUT);
   oled1.begin();
   oled2.begin();
+  
   for (int i = 0; i < sizeof(b1); i++) {
     b1[i] = reverse_byte(b1[i]);
   }
   for (int i = 0; i < sizeof(b2); i++) {
     b2[i] = reverse_byte(b2[i]);
   }
+  
   oled1.setFont(u8g2_font_ncenB08_tr);
   oled2.setFont(u8g2_font_ncenB08_tr);
   oled1.clearBuffer();
   oled2.clearBuffer();
+  
   // Init SPI and MFRC522 - This always works offline
   SPI.begin();
   mfrc522.PCD_Init();
@@ -246,7 +247,6 @@ void setup() {
   xTaskCreatePinnedToCore(TaskCore0code, "TaskCore0", 10000, NULL, 1, &TaskCore0, 0);
   xTaskCreatePinnedToCore(TaskCore1code, "TaskCore1", 10000, NULL, 1, &TaskCore1, 1);
   WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
-
 
   // Init SPIFFS - This always works offline
   if (!SPIFFS.begin(true)) {
@@ -271,7 +271,7 @@ void setup() {
       Serial.println("Created empty offline log file");
     }
   }
-  addUID("4E 12 31 03", "Sanidhya Jain");
+  // addUID("4E 12 31 03", "Sanidhya Jain");
 
   // Try WiFi connection with timeout
   setupWiFi();
@@ -298,7 +298,7 @@ void unlockDoorTask(void* pvParameters) {
   unlockTaskHandle = NULL;  // Mark task as free
   vTaskDelete(NULL);        // Kill this task
 }
-bool wifidisconnect;
+
 void setupWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -308,18 +308,30 @@ void setupWiFi() {
     if (millis() - startTime > WIFI_TIMEOUT) {
       Serial.println("\nWiFi connection timeout! Starting offline mode...");
       wifiConnected = false;
+      wifidisconnect = true; // FIXED: Set disconnect flag
       return;
     }
     Serial.print(".");
+    initialisingDeviceDisplay();
     delay(500);
   }
 
   Serial.println(" Connected!");
   wifiConnected = true;
+  wifidisconnect = false; // FIXED: Clear disconnect flag on successful connection
 }
+
 void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   wifiConnected = true;
   wifidisconnect = false;
+  
+  // FIXED: Initialize Firebase and NTP when WiFi reconnects
+  if (!firebaseReady) {
+    setupFirebase();
+  }
+  if (!ntpSynced) {
+    setupNTP();
+  }
 }
 
 void setupFirebase() {
@@ -360,6 +372,7 @@ void setupNTP() {
       return;
     }
     Serial.print(".");
+    initialisingDeviceDisplay();
     delay(500);
   }
 
@@ -383,17 +396,13 @@ void handleIRSensor() {
     }
   }
 }
+
 void menu() {
   oled1.clearBuffer();
 
   // Read potentiometer → pick option
   int potValue = analogRead(POT_PIN);
-  int option;
-  if (potValue < 2048) {  // Lower half = option 1
-    option = 1;
-  } else {  // Upper half = option 2
-    option = 2;
-  }
+  int option = map(potValue, 0, 4094, 1, 3);
 
   // Draw menu
   oled1.drawStr(0, 12, "ADMIN MODE");
@@ -402,25 +411,12 @@ void menu() {
 
   // Show current option at bottom
   char buf[20];
-  sprintf(buf, "Option: %d", option);
+  if (option == 3) {
+    sprintf(buf, "Option: Back");
+  } else sprintf(buf, "Option: %d", option);
+
   oled1.drawStr(0, 60, buf);
-
   oled1.sendBuffer();
-
-  // --- DELETE button → exit menu ---
-  bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
-    Serial.println(deleteCurrentState);
-  if (deleteCurrentState && !deletePressed && millis() - lastDeleteTime > debounceDelay) {
-    Serial.println("Button B pressed");
-    deletePressed = true;
-    lastDeleteTime = millis();
-
-    menuState = NORMAL_MODE;
-    oled1.clearBuffer();
-    oled1.sendBuffer();
-    return;
-  }
-  if (!deleteCurrentState) deletePressed = false;
 
   // --- SELECT button → confirm option ---
   bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
@@ -440,23 +436,32 @@ void menu() {
     }
 
     if (option == 2) {
-      // Step 2 → Close lab
-      sendDiscordNotification("Lab is closed");
+      // FIXED: Always attempt Discord notification, handle offline gracefully
+      String message = "Lab is closed";
+      sendDiscordNotification(message);
       menuState = NORMAL_MODE;
 
       oled1.clearBuffer();
-      oled1.drawStr(0, 30, "Lab Closed!");
+      if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+        oled1.drawStr(0, 20, "Lab Closed!");
+        oled1.drawStr(0, 35, "Discord notified");
+      } else {
+        oled1.drawStr(0, 20, "Lab Closed!");
+        oled1.drawStr(0, 35, "(Offline mode)");
+      }
       oled1.sendBuffer();
-      delay(1000);  // small feedback pause
-      oled1.clearBuffer();
-      oled1.sendBuffer();
+      delay(2000);  // Show message longer
+      showDefaultDisplay(); // Return to default display
+      return;
+    }
+    if (option == 3) {
+      menuState = NORMAL_MODE;
+      showDefaultDisplay(); // FIXED: Show default display when going back
       return;
     }
   }
   if (!selectCurrentState) selectPressed = false;
 }
-
-
 
 void handleRFID() {
   // Check for menu opening with debouncing (SELECT button only)
@@ -521,13 +526,16 @@ void handleRFID() {
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
 }
-bool bothPressed = false;
+
 void TaskCore0code(void* pvParameters) {
   pinMode(irSensor, INPUT);
 
   for (;;) {
     if (menuState == NORMAL_MODE) {
-      showDefaultDisplay();
+      // Only update display if not already showing entry
+      if (!entryActive) {
+        showDefaultDisplay();
+      }
       handleIRSensor();
       handleRFID();
       if (entryActive && millis() - entryStart >= 2000) {
@@ -545,75 +553,76 @@ void TaskCore0code(void* pvParameters) {
         currentChar = 'A';
         // Reset button states when entering NAME_ENTRY mode
         selectPressed = false;
-        deletePressed = false;
-        bothPressed = false;
         mfrc522.PICC_HaltA();
         mfrc522.PCD_StopCrypto1();
       }
     } else if (menuState == NAME_ENTRY) {
-      // DON'T reset button states here - let handleNameEntry manage them
       handleNameEntry();
     }
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
-
 void handleNameEntry() {
   int potValue = analogRead(POT_PIN);
-  int charIndex = map(potValue, 0, 4095, 0, 27);  // 0-25 for A-Z, 26 for space, 27 for OK
+  int charIndex = map(potValue, 0, 4095, 0, 28);  
+  // 0–25: A–Z, 26: space, 27: OK, 28: delete
 
+  // Pick current char
   if (charIndex < 26) {
-    currentChar = 'A' + charIndex;  // A-Z
+    currentChar = 'A' + charIndex;
   } else if (charIndex == 26) {
     currentChar = ' ';  // Space
-  } else {
-    currentChar = '\0';  // Special marker for OK (won't be displayed as char)
+  } else if (charIndex == 27) {
+    currentChar = '\0'; // OK marker (not added directly)
+  } else if (charIndex == 28) {
+    currentChar = '<';  // Delete marker
   }
 
   bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
-  bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
 
-  // --- SELECT pressed ---
+  // --- Handle button press with debounce ---
   if (selectCurrentState && !selectPressed && (millis() - lastSelectTime) > debounceDelay) {
     selectPressed = true;
     lastSelectTime = millis();
 
-    if (charIndex >= 27) {  // OK position
-      // Confirm and save the name
+    if (charIndex < 27) {  
+      // Add normal character or space
+      if (enteredName.length() < 16) {
+        enteredName += currentChar;
+        Serial.println("Added: " + String(currentChar) + " → " + enteredName);
+      }
+    } else if (charIndex == 27) {  
+      // OK selected
       if (enteredName.length() > 0 && pendingUID.length() > 0) {
         Serial.println("Saving UID+Name: " + pendingUID + " => " + enteredName);
         addUID(pendingUID, enteredName);
         enteredName = "";
         pendingUID = "";
         menuState = NORMAL_MODE;
-        // Reset button states when exiting
         selectPressed = false;
-        deletePressed = false;
         return;
       }
-    } else {
-      // Add current character
-      if (enteredName.length() < 16) {
-        enteredName += currentChar;
-        Serial.println("Added character: " + String(currentChar) + ", Name now: " + enteredName);
+    } else if (charIndex == 28) {  
+      // Delete last char
+      if (enteredName.length() > 0) {
+        enteredName.remove(enteredName.length() - 1);
+        Serial.println("Deleted → " + enteredName);
+      }
+      else if(enteredName.length() == 0){
+        menuState = NORMAL_MODE;
+        selectPressed = false;
+        return;
       }
     }
   }
-  if (!selectCurrentState) selectPressed = false;
-
-  // --- DELETE button ---
-  if (deleteCurrentState && !deletePressed && (millis() - lastDeleteTime) > debounceDelay) {
-    deletePressed = true;
-    lastDeleteTime = millis();
-    if (enteredName.length() > 0) {
-      enteredName.remove(enteredName.length() - 1);
-      Serial.println("Deleted character, Name now: " + enteredName);
-    }
-  }
-  if (!deleteCurrentState) deletePressed = false;
 
   updateNameEntryDisplay();
+
+  // --- Reset button state when released ---
+  if (!selectCurrentState) {
+    selectPressed = false;
+  }
 }
 
 void updateNameEntryDisplay() {
@@ -632,17 +641,20 @@ void updateNameEntryDisplay() {
 
   oled1.setCursor(0, 55);
   oled1.print("Char: ");
+  // Read potentiometer and map to 0–28
+  int potValue = analogRead(POT_PIN);
+  // Serial.println(potValue);
+  int charIndex = map(potValue, 0, 4095, 0, 28);
 
   // Display current selection
-  int potValue = analogRead(POT_PIN);
-  int charIndex = map(potValue, 0, 4095, 0, 27);
-
   if (charIndex < 26) {
-    oled1.print((char)('A' + charIndex));  // A-Z
+    oled1.print((char)('A' + charIndex));  // A–Z
   } else if (charIndex == 26) {
-    oled1.print("SPACE");  // Space
-  } else {
-    oled1.print("OK");  // Confirmation
+    oled1.print("SPACE");
+  } else if (charIndex == 27) {
+    oled1.print("OK");
+  } else if (charIndex == 28) {
+    oled1.print("DEL");  // backspace
   }
 
   oled1.sendBuffer();
@@ -652,31 +664,50 @@ void TaskCore1code(void* pvParameters) {
   LogEntry entry;
   for (;;) {
     unsigned long currentMillis = millis();
-    // if WiFi is down, try reconnecting
+    // FIXED: WiFi reconnection logic
     if ((currentMillis - previousMillis >= 5000)) {
-      bool wificheck;
-      if (WiFi.status() == WL_CONNECTED) {
-        wificheck = false;
-      } else wificheck == true;
-      if (wificheck) {
-        Serial.println("Trying to Reconnect");
-        WiFi.reconnect();
+      bool needsReconnection = (WiFi.status() != WL_CONNECTED); // FIXED: Simplified condition
+      
+      if (needsReconnection && wifidisconnect) {
+        Serial.println("Trying to Reconnect WiFi...");
+        WiFi.disconnect();
+        delay(100);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        
         unsigned long startTime = millis();
         while (WiFi.status() != WL_CONNECTED) {
-          if (millis() - startTime > 5000) {
-            Serial.println("\nWiFi connection timeout! Starting offline mode...");
+          if (millis() - startTime > 10000) { // FIXED: Shorter timeout for reconnection
+            Serial.println("\nWiFi reconnection timeout! Staying offline...");
             wifiConnected = false;
-            wifidisconnect = true;
-            return;
+            break; // FIXED: Don't return, continue the loop
           }
           Serial.print(".");
           delay(500);
         }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("\nWiFi reconnected successfully!");
+          wifiConnected = true;
+          wifidisconnect = false;
+          
+          // Re-initialize Firebase and NTP
+          if (!firebaseReady) {
+            setupFirebase();
+          }
+          if (!ntpSynced) {
+            setupNTP();
+          }
+        }
+      } else if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        wifidisconnect = false;
       }
+      
       previousMillis = currentMillis;
     }
+    
     // Wait for a log entry
-    if (xQueueReceive(logQueue, &entry, portMAX_DELAY)) {
+    if (xQueueReceive(logQueue, &entry, 100 / portTICK_PERIOD_MS)) { // FIXED: Don't block indefinitely
       // Try logging online (non-blocking for Core 0)
       tryOnlineLogging(entry.uid, entry.name, entry.accessGranted);
     }
@@ -684,6 +715,7 @@ void TaskCore1code(void* pvParameters) {
 }
 
 void loop() {
+  // Empty - using tasks
 }
 
 void tryOnlineLogging(String uid, String name, bool accessGranted) {
@@ -705,10 +737,11 @@ void tryOnlineLogging(String uid, String name, bool accessGranted) {
     offlineLogEntry(entry);
     return;
   }
+  
+  // FIXED: Sync offline logs when connection is restored
   if (!wifidisconnect) {
     syncOfflineLogsToFirebase();
   }
-
 
   // Try online logging
   logToFirebaseWithTimeout(uid, name);
@@ -732,6 +765,7 @@ void logToFirebaseWithTimeout(String uid, String name) {
     Serial.println("Firebase error (timeout/connection): " + fbdo.errorReason());
   }
 }
+
 uint64_t fnv1a64(const char* data, size_t len) {
   uint64_t hash = 1469598103934665603ULL;   // FNV offset basis
   const uint64_t prime = 1099511628211ULL;  // FNV prime
@@ -743,27 +777,52 @@ uint64_t fnv1a64(const char* data, size_t len) {
 
   return hash;
 }
+void initialisingDeviceDisplay() {
+  // Both OLEDs show b2
+  oled1.clearBuffer();
+    oled1.drawStr(20, 30, "INITIALISING");
+  
+  oled1.sendBuffer();
+
+}
 void showDefaultDisplay() {
   // Both OLEDs show b2
   oled1.clearBuffer();
-  oled1.drawXBMP(0, 0, 128, 64, b2);
+  if (sizeof(b2) > 0) {
+    oled1.drawXBMP(0, 0, 128, 64, b2);
+  } else {
+    oled1.drawStr(20, 30, "RFID Ready");
+  }
   oled1.sendBuffer();
 
   oled2.clearBuffer();
-  oled2.drawXBMP(0, 0, 128, 64, b2);
+  if (sizeof(b2) > 0) {
+    oled2.drawXBMP(0, 0, 128, 64, b2);
+  } else {
+    oled2.drawStr(20, 30, "RFID Ready");
+  }
   oled2.sendBuffer();
 }
 
 void showEntryDisplay() {
-  // Only oled1 shows b1, oled2 still shows b2
+  // Only oled2 shows b1, oled1 still shows b2
   oled2.clearBuffer();
-  oled2.drawXBMP(0, 0, 128, 64, b1);
+  if (sizeof(b1) > 0) {
+    oled2.drawXBMP(0, 0, 128, 64, b1);
+  } else {
+    oled2.drawStr(15, 30, "ACCESS GRANTED");
+  }
   oled2.sendBuffer();
 
   oled1.clearBuffer();
-  oled1.drawXBMP(0, 0, 128, 64, b2);
+  if (sizeof(b2) > 0) {
+    oled1.drawXBMP(0, 0, 128, 64, b2);
+  } else {
+    oled1.drawStr(20, 30, "RFID Ready");
+  }
   oled1.sendBuffer();
 }
+
 String generateLogID(const String& rfidUid) {
   // Combine UID + Time string
   String input = rfidUid + "_" + getCurrentTime();
@@ -794,13 +853,20 @@ String getCurrentTime() {
 }
 
 void sendDiscordNotification(String message) {
+  // FIXED: Better error handling and offline notification
   if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cannot send Discord notification - offline mode");
     return;  // Skip if offline
   }
 
   HTTPClient http;
   http.setTimeout(5000);  // 5 second timeout
-  http.begin(DISCORD_WEBHOOK);
+  
+  if (!http.begin(DISCORD_WEBHOOK)) {
+    Serial.println("✗ Discord: Failed to begin HTTP connection");
+    return;
+  }
+  
   http.addHeader("Content-Type", "application/json");
 
   String payload = "{\"content\": \"" + message + "\"}";
@@ -808,6 +874,9 @@ void sendDiscordNotification(String message) {
 
   if (httpResponseCode > 0) {
     Serial.println("✓ Discord notified: " + String(httpResponseCode));
+    if (httpResponseCode == 200 || httpResponseCode == 204) {
+      Serial.println("✓ Discord message sent successfully");
+    }
   } else {
     Serial.println("✗ Discord failed: " + http.errorToString(httpResponseCode));
   }
@@ -870,6 +939,7 @@ void addUID(String uid, String name) {
     Serial.println("UID saved: " + uid);
   }
 }
+
 void offlineLogEntry(LogEntry entry) {
   // Open existing file or create a new one
   File file = SPIFFS.open(offlineLogPath, "r");
