@@ -43,8 +43,8 @@ bool entryActive = false;
 unsigned long entryStart = 0;
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled1(U8G2_R0, /* clock=*/22, /* data=*/21, /* reset=*/U8X8_PIN_NONE);  //small oled
-U8G2_SH1106_128X64_NONAME_F_SW_I2C oled2(U8G2_R0, /* clock=*/25, /* data=*/26, /* reset=*/U8X8_PIN_NONE);   //big oled
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled1(U8G2_R0, /* clock=*/25, /* data=*/26, /* reset=*/U8X8_PIN_NONE);  //small oled
+U8G2_SH1106_128X64_NONAME_F_SW_I2C oled2(U8G2_R0, /* clock=*/22, /* data=*/21, /* reset=*/U8X8_PIN_NONE);   //big oled
 
 const char* jsonFilePath = "/uids.json";
 const char* offlineLogPath = "/offline.json";
