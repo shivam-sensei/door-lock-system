@@ -3,4 +3,4 @@
 *-backups/
 fp-info-cache
 *.zip
-secrets.h
+*.h
